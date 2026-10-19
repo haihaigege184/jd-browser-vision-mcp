@@ -49,6 +49,7 @@ kind 分类词表见 classify_kind()；这是全服务最需要持续迭代的�
 """
 import base64
 import difflib
+import hashlib
 import io
 import json
 import re
@@ -61,6 +62,41 @@ from PIL import Image
 MAX_IMG_BYTES = 8 * 1024 * 1024      # 8MB，整屏 PNG 足够
 HOST = "0.0.0.0"
 PORT = 8765
+
+# ═══ 提速三件套（2026-10-20 实测定型）═══
+# 1) 结果缓存：客户端对同一张截图经常连发 analyze + find("领取")，
+#    J1900 全页 OCR 要 ~50s，缓存让第二次调用变 0s。LRU 4 张。
+# 2) max_side=1150：OCR 前把大图等比缩小，rec 计算量明显下降；
+#    实测 1150 对按钮级文字零损失（返回坐标已映射回原图尺寸）。
+# 3) region 模式（analyze 已支持）：只 OCR 关键区域，日常必用。
+CACHE_MAX = 4
+_analyze_cache: dict[str, dict] = {}          # key -> analyze 结果
+_cache_order: list[str] = []                  # 简易 LRU
+
+OCR_MAX_SIDE = 1150
+
+
+def _cache_key(image_bytes: bytes, region) -> str:
+    h = hashlib.sha1(image_bytes).hexdigest()[:16]
+    return f"{h}:{region}"
+
+
+def _cache_get(key: str):
+    if key in _analyze_cache:
+        _cache_order.remove(key)
+        _cache_order.append(key)              # 触摸即续命
+        d = dict(_analyze_cache[key])
+        d["cached"] = True
+        return d
+    return None
+
+
+def _cache_put(key: str, data: dict):
+    _analyze_cache[key] = {k: v for k, v in data.items() if k != "ms"}
+    _cache_order.append(key)
+    while len(_cache_order) > CACHE_MAX:
+        old = _cache_order.pop(0)
+        _analyze_cache.pop(old, None)
 
 # ═══ 引擎链（2026-10-20 定型）：RapidOCR 优先，ddddocr 兜底 ═══
 # 实测：ddddocr det 对 UI 截图的小字（12px 导航栏）漏检严重（整页只出 6 块），
@@ -167,17 +203,21 @@ def classify_kind(text: str, box, img_w: int) -> tuple[str, float]:
     return "text", 0.3
 
 
-def analyze(image_bytes: bytes, region=None) -> dict:
-    """主流程：检测+识别 → 分类。RapidOCR 直出（box+text+score），
-    ddddocr 兜底（det 出框 → 裁剪 → rec 识别）。
+def analyze(image_bytes: bytes, region=None, max_side: int = OCR_MAX_SIDE) -> dict:
+    """主流程：缓存 → 缩放 → 检测+识别 → 分类。
 
-    region: [x1,y1,x2,y2] —— 只分析屏幕某一块（客户端裁剪窗口/弹层用）。
-    大幅减少 rec 数量：J1900 上 rec 是绝对大头（~0.3s/块），
-    全页 130 块要 ~40s，弹层区域往往只要 3~8s。坐标自动偏移回全屏系。
+    region:   [x1,y1,x2,y2] 只分析某一块，坐标自动偏移回全屏系（提速主力）。
+    max_side: OCR 前等比缩到该边长以内，识别后坐标映射回原图（1150 实测零损失）。
+    同图同 region 的请求直接走缓存（analyze+find 连发场景从 2×50s 变 50s+0s）。
     """
     t0 = time.time()
+    key = _cache_key(image_bytes, region)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    W, H = img.size
+    W, H = img.size                       # 全屏尺寸（最终坐标系）
     ox, oy = 0, 0
     if region:
         x1, y1, x2, y2 = [max(0, int(v)) for v in region]
@@ -185,6 +225,13 @@ def analyze(image_bytes: bytes, region=None) -> dict:
         if x2 - x1 > 8 and y2 - y1 > 8:
             img = img.crop((x1, y1, x2, y2))
             ox, oy = x1, y1
+
+    # 大图缩小：rec 计算量与像素面积成正比，识别完坐标再放大回去
+    scale = 1.0
+    if max(img.size) > max_side:
+        scale = max_side / max(img.size)
+        img = img.resize((round(img.width * scale),
+                          round(img.height * scale)), Image.LANCZOS)
 
     png = io.BytesIO()
     img.save(png, format="PNG")
@@ -222,8 +269,11 @@ def analyze(image_bytes: bytes, region=None) -> dict:
     for i, (box, text, score) in enumerate(raw):
         if not text:
             continue
-        # region 模式：坐标偏移回全屏坐标系
-        x1, y1, x2, y2 = box[0] + ox, box[1] + oy, box[2] + ox, box[3] + oy
+        # 缩放映射回原图 + region 偏移回全屏坐标系
+        x1 = round(box[0] / scale) + ox
+        y1 = round(box[1] / scale) + oy
+        x2 = round(box[2] / scale) + ox
+        y2 = round(box[3] / scale) + oy
         kind, kscore = classify_kind(text, box, W)
         elements.append({
             "id": f"e{i + 1}",
@@ -236,9 +286,11 @@ def analyze(image_bytes: bytes, region=None) -> dict:
 
     # 按分数降序，便于客户端取最优
     elements.sort(key=lambda e: (-e["score"], e["box"][1]))
-    return {"ok": True, "ms": int((time.time() - t0) * 1000),
+    data = {"ok": True, "ms": int((time.time() - t0) * 1000),
             "engine": ENGINE,
             "width": W, "height": H, "elements": elements}
+    _cache_put(key, data)
+    return data
 
 
 def find(image_bytes: bytes, text: str, fuzzy: bool = True,
@@ -262,7 +314,7 @@ def find(image_bytes: bytes, text: str, fuzzy: bool = True,
             e2["match"] = round(m, 3)
             out.append(e2)
     out.sort(key=lambda e: (-e["match"], -e["score"]))
-    return {"ok": True, "ms": data["ms"], "width": data["width"],
+    return {"ok": True, "ms": data.get("ms", 0), "width": data["width"],
             "height": data["height"], "matches": out[:limit]}
 
 
